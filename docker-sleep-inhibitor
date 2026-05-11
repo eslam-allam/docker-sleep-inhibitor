@@ -1,50 +1,47 @@
 #!/bin/env bash
 
-# Add this near the top of your script
+trap cleanup SIGINT SIGTERM
+
 cleanup() {
     echo "Script exiting. Releasing all locks..."
-    exec 3>&-  # Close the FD explicitly
+    if [ -n "$INHIBIT_PID" ]; then
+        kill "$INHIBIT_PID" 2>/dev/null
+    fi
     exit 0
 }
 
 LABEL_KEY="system.sleep.inhibit"
 LABEL_VALUE="true"
-INHIBIT_FD=0
+INHIBIT_PID=""
 
-# Function to check and toggle the inhibit lock
 update_inhibit() {
-    # Count running containers with the specific label
+    local TRIGGER_REASON=$1
+
     COUNT=$(docker ps -q --filter "label=${LABEL_KEY}=${LABEL_VALUE}" | wc -l)
 
     if [ "$COUNT" -gt 0 ]; then
-        if [ "$INHIBIT_FD" -eq 0 ]; then
-            echo "Container with $LABEL_KEY=$LABEL_VALUE detected. Inhibiting sleep..."
-            # Create a file descriptor lock to keep systemd-inhibit alive
-            exec 3> >(systemd-inhibit --what=idle:sleep --why="Docker container with $LABEL_KEY=$LABEL_VALUE is running" sleep infinity)
-            INHIBIT_FD=3
+        if [ -z "$INHIBIT_PID" ]; then
+            echo "Event: $TRIGGER_REASON"
+            echo "Container(s) with $LABEL_KEY=$LABEL_VALUE detected. Inhibiting sleep..."
+            systemd-inhibit --what=idle:sleep \
+                            --why="Docker container management" \
+                            sleep infinity &
+            INHIBIT_PID=$!
         fi
     else
-        if [ "$INHIBIT_FD" -ne 0 ]; then
-            echo "No containers with $LABEL_KEY=$LABEL_VALUE found. Releasing sleep lock."
-            # Closing the file descriptor kills the systemd-inhibit process
-            exec 3>&-
-            INHIBIT_FD=0
+        if [ -n "$INHIBIT_PID" ]; then
+            echo "Event: $TRIGGER_REASON"
+            echo "No relevant containers found. Releasing sleep lock."
+            kill "$INHIBIT_PID" 2>/dev/null
+            INHIBIT_PID=""
         fi
     fi
 }
 
 echo "Starting up initial scan..."
-# Run once at startup to catch anything already running
-update_inhibit
+update_inhibit "Initial Scan"
+echo "Watching for container events..."
 
-echo "Initial Scan complete. Watching for container events..."
-
-# Watch for start and die events
-docker events --filter "event=start" --filter "event=die" --format '{{.Action}} {{index .Actor.Attributes "name"}}' | while read -r ACTION NAME; do
-    echo "Event detected: Container '$NAME' performed action '$ACTION'"
-    update_inhibit
+docker events --filter "label=${LABEL_KEY}=${LABEL_VALUE}" --format '{{.Action}} {{index .Actor.Attributes "name"}}' | while read -r ACTION NAME; do
+    update_inhibit "Container '$NAME' performed '$ACTION'"
 done
-
-trap cleanup SIGINT SIGTERM
-
-echo 'Done...'
